@@ -32,6 +32,17 @@ NBA_TEAMS = {
     "OKC","ORL","PHI","PHX","POR","SAC","SAS","TOR","UTA","WAS"
 }
 
+# ESPN's site API uses a few non-standard abbreviations.
+# Convert them to the canonical 3-letter NBA codes used by EDGE.
+ESPN_TEAM_ALIASES = {
+    "GS": "GSW",
+    "NO": "NOP",
+    "NY": "NYK",
+    "SA": "SAS",
+    "UTAH": "UTA",
+    "WSH": "WAS",
+}
+
 VALID_POSITIONS = {"PG", "SG", "SF", "PF", "C"}
 
 TEAM_LIST_URL = (
@@ -55,6 +66,11 @@ HEADERS = {
 
 session = requests.Session()
 session.headers.update(HEADERS)
+
+
+def canonical_team_abbr(value: Any) -> str:
+    abbr = str(value or "").upper().strip()
+    return ESPN_TEAM_ALIASES.get(abbr, abbr)
 
 
 def get_json(url: str, retries: int = 3) -> dict[str, Any]:
@@ -230,7 +246,7 @@ def parse_athlete_entry(
 
 def parse_depth_chart(team: dict[str, Any]) -> list[dict[str, Any]]:
     team_id = str(team["id"])
-    abbr = str(team["abbreviation"]).upper()
+    abbr = canonical_team_abbr(team["abbreviation"])
 
     payload = get_json(DEPTH_URL.format(team_id=team_id))
     rows = []
@@ -306,13 +322,22 @@ def main() -> None:
     selected = []
 
     for team in teams:
-        abbr = str(team.get("abbreviation") or "").upper()
+        raw_abbr = str(team.get("abbreviation") or "").upper().strip()
+        abbr = canonical_team_abbr(raw_abbr)
+
         if abbr in NBA_TEAMS:
             selected.append({
                 "id": team.get("id"),
                 "abbreviation": abbr,
+                "espn_abbreviation": raw_abbr,
                 "displayName": team.get("displayName"),
             })
+
+    # Defensive dedupe in case ESPN exposes duplicate team aliases.
+    selected_by_abbr = {}
+    for team in selected:
+        selected_by_abbr[team["abbreviation"]] = team
+    selected = list(selected_by_abbr.values())
 
     found = {x["abbreviation"] for x in selected}
     missing = sorted(NBA_TEAMS - found)
