@@ -58,6 +58,11 @@ jobs:
       - name: Fetch ESPN NBA player positions
         run: |
           mkdir -p data
+
+          python fetch_nba_positions.py \
+            --season 2025 \
+            --output data
+
           python fetch_nba_positions.py \
             --season 2026 \
             --output data
