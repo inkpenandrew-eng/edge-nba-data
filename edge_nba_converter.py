@@ -27,6 +27,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -142,6 +144,116 @@ def player_name(row: pd.Series, df: pd.DataFrame) -> str:
     first = str(row.get(fcol, "") or "").strip() if fcol else ""
     last = str(row.get(lcol, "") or "").strip() if lcol else ""
     return (first + " " + last).strip()
+
+
+def normalize_player_name(value: Any) -> str:
+    """
+    Normalize player names for conservative ESPN matching.
+
+    Examples:
+      Nikola Jokić -> nikola jokic
+      P.J. Washington -> pj washington
+      Ron Harper Jr. -> ron harper
+    """
+    s = str(value or "").strip()
+    if not s:
+        return ""
+
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.lower()
+
+    # Normalize common punctuation / apostrophes.
+    s = s.replace("’", "'").replace("‘", "'")
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+
+    parts = [p for p in s.split() if p]
+
+    # Remove common suffixes only at the end.
+    while parts and parts[-1] in {"jr", "sr", "ii", "iii", "iv", "v"}:
+        parts.pop()
+
+    return " ".join(parts)
+
+
+def load_espn_positions(path: Path | None) -> dict[str, Any] | None:
+    if path is None or not path.exists():
+        return None
+
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    players = data.get("players") or []
+    valid_positions = {"PG", "SG", "SF", "PF", "C"}
+
+    exact = {}
+    by_name = {}
+
+    for row in players:
+        if not isinstance(row, dict):
+            continue
+
+        team = str(row.get("team") or "").upper().strip()
+        name = normalize_player_name(row.get("player"))
+        pos = str(row.get("position") or "").upper().strip()
+
+        if team not in NBA_TEAMS or not name or pos not in valid_positions:
+            continue
+
+        exact[(team, name)] = pos
+        by_name.setdefault(name, set()).add((team, pos))
+
+    return {
+        "raw": data,
+        "exact": exact,
+        "by_name": by_name,
+    }
+
+
+def apply_espn_positions(
+    pg: pd.DataFrame,
+    position_data: dict[str, Any] | None,
+) -> pd.DataFrame:
+    out = pg.copy()
+
+    out["position_exact"] = None
+    out["position_source"] = "source_fallback"
+
+    if not position_data:
+        out["concession_position"] = out["position_group"]
+        return out
+
+    exact = position_data["exact"]
+    by_name = position_data["by_name"]
+
+    def resolve(row: pd.Series) -> tuple[str | None, str]:
+        team = str(row.get("team") or "").upper().strip()
+        name = normalize_player_name(row.get("player"))
+
+        # Highest-confidence match: same team + normalized name.
+        pos = exact.get((team, name))
+        if pos:
+            return pos, "espn_team_name"
+
+        # Conservative fallback:
+        # only use name-only when ESPN has exactly one record for that name.
+        candidates = by_name.get(name) or set()
+        if len(candidates) == 1:
+            _, pos = next(iter(candidates))
+            return pos, "espn_unique_name"
+
+        return None, "source_fallback"
+
+    resolved = out.apply(resolve, axis=1, result_type="expand")
+    out["position_exact"] = resolved[0]
+    out["position_source"] = resolved[1]
+
+    out["concession_position"] = out["position_exact"].where(
+        out["position_exact"].isin(["PG", "SG", "SF", "PF", "C"]),
+        out["position_group"],
+    )
+
+    return out
 
 
 def normalize_position_group(raw: Any) -> str:
@@ -402,8 +514,21 @@ def build_players(pg: pd.DataFrame) -> list[dict[str, Any]]:
             ),
             "player": str(latest.get("player") or ""),
             "team": str(latest.get("team") or ""),
+            "position": (
+                str(latest.get("position_exact"))
+                if latest.get("position_exact") in {"PG", "SG", "SF", "PF", "C"}
+                else str(latest.get("position_group") or "UNKNOWN")
+            ),
+            "position_exact": (
+                str(latest.get("position_exact"))
+                if latest.get("position_exact") in {"PG", "SG", "SF", "PF", "C"}
+                else None
+            ),
             "position_group": str(
                 latest.get("position_group") or "UNKNOWN"
+            ),
+            "position_source": str(
+                latest.get("position_source") or "source_fallback"
             ),
             "position_raw": (
                 None if pd.isna(latest.get("position_raw"))
@@ -428,14 +553,16 @@ def build_players(pg: pd.DataFrame) -> list[dict[str, Any]]:
 
 def build_position_concessions(pg: pd.DataFrame) -> list[dict[str, Any]]:
     """
-    Temporary G/F/C concessions.
+    Build exact PG / SG / SF / PF / C concessions when ESPN mapping exists.
 
-    G/F hybrids are excluded rather than guessed. Once ESPN depth charts
-    are wired in, this becomes PG/SG/SF/PF/C.
+    Players without a confident exact ESPN position are excluded from the
+    exact five-position concession tables rather than guessed.
     """
+    valid_positions = ["PG", "SG", "SF", "PF", "C"]
+
     valid = pg[
         pg["opponent"].isin(NBA_TEAMS)
-        & pg["position_group"].isin(["G", "F", "C"])
+        & pg["concession_position"].isin(valid_positions)
     ].copy()
 
     stat_cols = ["pts", "reb", "ast", "stl", "blk", "three_pm"]
@@ -445,7 +572,7 @@ def build_position_concessions(pg: pd.DataFrame) -> list[dict[str, Any]]:
 
     per_game = (
         valid.groupby(
-            ["opponent", "game_id_norm", "game_date", "position_group"],
+            ["opponent", "game_id_norm", "game_date", "concession_position"],
             dropna=False
         )[stat_cols]
         .sum()
@@ -453,7 +580,7 @@ def build_position_concessions(pg: pd.DataFrame) -> list[dict[str, Any]]:
         .rename(
             columns={
                 "opponent": "team",
-                "position_group": "position"
+                "concession_position": "position"
             }
         )
     )
@@ -500,8 +627,7 @@ def build_position_concessions(pg: pd.DataFrame) -> list[dict[str, Any]]:
         )
 
     out = []
-
-    order = {"G": 0, "F": 1, "C": 2}
+    order = {"PG": 0, "SG": 1, "SF": 2, "PF": 3, "C": 4}
 
     for _, row in season.iterrows():
         key = (row["team"], row["position"])
@@ -642,6 +768,26 @@ def validate_payload(payload: dict[str, Any]) -> dict[str, Any]:
         for x in concessions
     })
 
+    exact_players = [
+        p for p in players
+        if p.get("position_exact") in {"PG", "SG", "SF", "PF", "C"}
+    ]
+
+    unmatched_players = [
+        {
+            "player": p["player"],
+            "team": p["team"],
+            "fallback_position": p.get("position_group"),
+        }
+        for p in players
+        if p.get("position_exact") not in {"PG", "SG", "SF", "PF", "C"}
+    ]
+
+    coverage = (
+        round(100.0 * len(exact_players) / len(players), 1)
+        if players else 0.0
+    )
+
     return {
         "team_count": len(team_codes),
         "team_codes": team_codes,
@@ -664,13 +810,20 @@ def validate_payload(payload: dict[str, Any]) -> dict[str, Any]:
             for p in players
             if p["games_played"] > 82
         ],
+        "exact_position_players": len(exact_players),
+        "exact_position_coverage_pct": coverage,
+        "unmatched_position_players": len(unmatched_players),
+        "unmatched_position_examples": unmatched_players[:40],
+        "expected_exact_concession_positions": ["PG", "SG", "SF", "PF", "C"],
+        "expected_full_concession_rows": 150,
     }
 
 
 def build_season(
     input_dir: Path,
     output_dir: Path,
-    season: int
+    season: int,
+    positions_dir: Path | None = None,
 ) -> Path:
 
     pfile = input_dir / f"playerlog_{season}.parquet"
@@ -689,6 +842,14 @@ def build_season(
 
     pg = prepare_player_games(players, games)
 
+    position_file = (
+        positions_dir / f"nba_positions_{season}.json"
+        if positions_dir is not None
+        else None
+    )
+    position_data = load_espn_positions(position_file)
+    pg = apply_espn_positions(pg, position_data)
+
     payload = {
         "success": True,
         "dataset": "edge_nba_intelligence",
@@ -702,7 +863,7 @@ def build_season(
         "notes": {
             "scope": "NBA regular season only; NBA teams only; player rows must match the cleaned NBA gamelog.",
             "position_concession_rank": "#1 means most conceded.",
-            "position_model": "Temporary G/F/C model. ESPN depth charts will later map active players to PG/SG/SF/PF/C.",
+            "position_model": "ESPN Fantasy primary position maps players to exact PG/SG/SF/PF/C when confidently matched; unmatched players retain source fallback labels and are excluded from exact concession tables.",
             "first_basket": "Not included. Requires play-by-play data."
         }
     }
@@ -727,6 +888,8 @@ def build_season(
         f"{payload['validation']['player_count']} players | "
         f"max GP {payload['validation']['max_player_games']} | "
         f"over82 {len(payload['validation']['games_over_82'])} | "
+        f"exact {payload['validation']['exact_position_coverage_pct']}% | "
+        f"concession rows {payload['validation']['concession_rows']} | "
         f"positions {payload['validation']['concession_positions']}"
     )
 
@@ -755,13 +918,29 @@ def main() -> None:
         default=[2025, 2026]
     )
 
+    parser.add_argument(
+        "--positions-dir",
+        default=None,
+        help="Folder containing nba_positions_<season>.json files"
+    )
+
     args = parser.parse_args()
 
     input_dir = Path(args.input).resolve()
     output_dir = Path(args.output).resolve()
+    positions_dir = (
+        Path(args.positions_dir).resolve()
+        if args.positions_dir
+        else None
+    )
 
     for season in args.seasons:
-        out = build_season(input_dir, output_dir, season)
+        out = build_season(
+            input_dir,
+            output_dir,
+            season,
+            positions_dir=positions_dir,
+        )
         print(f"Built: {out}")
 
 
