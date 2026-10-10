@@ -26,27 +26,32 @@ jobs:
         run: |
           mkdir -p source
 
-          curl -L \
+          curl -fL \
             https://raw.githubusercontent.com/llimllib/nba_data/main/data/playerlog_2025.parquet \
             -o source/playerlog_2025.parquet
 
-          curl -L \
+          curl -fL \
             https://raw.githubusercontent.com/llimllib/nba_data/main/data/gamelog_2025.parquet \
             -o source/gamelog_2025.parquet
 
-          curl -L \
+          if curl -fL \
             https://raw.githubusercontent.com/llimllib/nba_data/main/data/team_summary_2025.json \
-            -o source/team_summary_2025.json
+            -o source/team_summary_2025.json; then
+            echo "Downloaded 2025 team summary"
+          else
+            rm -f source/team_summary_2025.json
+            echo "2025 team summary unavailable; converter will use game logs"
+          fi
 
-          curl -L \
+          curl -fL \
             https://raw.githubusercontent.com/llimllib/nba_data/main/data/playerlog_2026.parquet \
             -o source/playerlog_2026.parquet
 
-          curl -L \
+          curl -fL \
             https://raw.githubusercontent.com/llimllib/nba_data/main/data/gamelog_2026.parquet \
             -o source/gamelog_2026.parquet
 
-          curl -L \
+          curl -fL \
             https://raw.githubusercontent.com/llimllib/nba_data/main/data/team_summary_2026.json \
             -o source/team_summary_2026.json
 
@@ -57,6 +62,9 @@ jobs:
             --input source \
             --output data \
             --seasons 2025 2026
+
+      - name: Fetch ESPN NBA depth charts
+        run: python fetch_nba_depthcharts.py
 
       - name: Commit updated NBA data
         run: |
