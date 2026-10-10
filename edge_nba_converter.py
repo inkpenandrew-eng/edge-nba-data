@@ -12,8 +12,9 @@ Outputs:
 
 This version:
   - keeps only the 30 NBA teams
-  - keeps only player rows matched to the NBA gamelog
-  - removes exhibition / celebrity / international noise
+  - keeps REGULAR-SEASON games only (NBA game-id prefix 002)
+  - keeps only player rows matched to the cleaned NBA gamelog
+  - removes exhibition / celebrity / international / playoff noise
   - prevents unmatched playerlog rows from inflating games played
   - builds player season / last 10 / last 5 averages
   - builds team intelligence
@@ -179,6 +180,45 @@ def normalize_position_group(raw: Any) -> str:
     return "UNKNOWN"
 
 
+def normalize_game_id(v: Any) -> str:
+    """
+    Normalize NBA game ids to their standard 10-digit form.
+
+    This handles Parquet columns that may store ids numerically and therefore
+    drop leading zeroes. Example:
+      22500001 -> 0022500001
+    """
+    if v is None:
+        return ""
+
+    s = str(v).strip()
+
+    # Handle numeric-looking strings such as "22500001.0".
+    if s.endswith(".0"):
+        s = s[:-2]
+
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if not digits:
+        return ""
+
+    return digits.zfill(10)
+
+
+def is_regular_season_game_id(v: Any) -> bool:
+    """
+    NBA game-id convention:
+      001 = preseason
+      002 = regular season
+      003 = All-Star
+      004 = playoffs
+      005 = play-in / other postseason bucket in some feeds
+
+    EDGE player season / L10 / L5 datasets use regular season only so that
+    season averages and games played are directly comparable.
+    """
+    return normalize_game_id(v).startswith("002")
+
+
 def parse_opponent_and_home(matchup: Any) -> tuple[str | None, bool | None]:
     if matchup is None:
         return None, None
@@ -235,7 +275,7 @@ def prepare_games(games: pd.DataFrame) -> pd.DataFrame:
     matchup_col = first_existing(g, GAME_MATCHUP_CANDIDATES)
     wl_col = first_existing(g, GAME_WL_CANDIDATES, required=False)
 
-    g["game_id_norm"] = g[game_col].astype(str)
+    g["game_id_norm"] = g[game_col].map(normalize_game_id)
     g["team"] = g[team_col].astype(str).str.upper().str.strip()
     g["game_date"] = pd.to_datetime(g[date_col], errors="coerce")
     g["matchup_norm"] = g[matchup_col].astype(str)
@@ -252,9 +292,13 @@ def prepare_games(games: pd.DataFrame) -> pd.DataFrame:
     else:
         g["wl"] = None
 
-    # Core clean-up: only NBA-vs-NBA games.
+    # Core clean-up:
+    # 1) regular season only
+    # 2) NBA team vs NBA team only
+    # 3) valid dated rows only
     g = g[
-        g["team"].isin(NBA_TEAMS)
+        g["game_id_norm"].str.startswith("002")
+        & g["team"].isin(NBA_TEAMS)
         & g["opponent"].isin(NBA_TEAMS)
         & g["game_date"].notna()
     ].copy()
@@ -276,7 +320,7 @@ def prepare_player_games(players: pd.DataFrame, games: pd.DataFrame) -> pd.DataF
     p_pos = first_existing(p, PLAYER_POSITION_CANDIDATES, required=False)
     p_pid = first_existing(p, PLAYER_ID_CANDIDATES, required=False)
 
-    p["game_id_norm"] = p[p_game].astype(str)
+    p["game_id_norm"] = p[p_game].map(normalize_game_id)
 
     if p_team_id:
         p["team_id_norm"] = p[p_team_id].astype(str)
@@ -609,6 +653,17 @@ def validate_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "max_player_games": max_gp,
         "concession_positions": positions,
         "concession_rows": len(concessions),
+        "regular_season_only": True,
+        "expected_max_player_games": 82,
+        "games_over_82": [
+            {
+                "player": p["player"],
+                "team": p["team"],
+                "games_played": p["games_played"]
+            }
+            for p in players
+            if p["games_played"] > 82
+        ],
     }
 
 
@@ -645,7 +700,7 @@ def build_season(
         "teams": build_team_intelligence(games, summary),
         "position_concessions": build_position_concessions(pg),
         "notes": {
-            "scope": "NBA teams only; player rows must match the cleaned NBA gamelog.",
+            "scope": "NBA regular season only; NBA teams only; player rows must match the cleaned NBA gamelog.",
             "position_concession_rank": "#1 means most conceded.",
             "position_model": "Temporary G/F/C model. ESPN depth charts will later map active players to PG/SG/SF/PF/C.",
             "first_basket": "Not included. Requires play-by-play data."
@@ -671,6 +726,7 @@ def build_season(
         f"{payload['validation']['team_count']} teams | "
         f"{payload['validation']['player_count']} players | "
         f"max GP {payload['validation']['max_player_games']} | "
+        f"over82 {len(payload['validation']['games_over_82'])} | "
         f"positions {payload['validation']['concession_positions']}"
     )
 
