@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 """
-Fetch current NBA depth charts from ESPN and save a clean JSON file.
+Fetch ESPN NBA depth charts from the ESPN CORE API.
 
 Output:
   data/nba_depthcharts.json
 
-The script:
-  - fetches the 30 NBA teams from ESPN
-  - fetches each team's current depth chart
-  - preserves ESPN's exact PG / SG / SF / PF / C slots
-  - records depth rank within each position
-  - resolves athlete names/ids when ESPN returns reference objects
-  - validates that all 30 NBA teams are present
+Uses:
+  sports.core.api.espn.com/v2/sports/basketball/leagues/nba/
+  seasons/{season}/teams/{team_id}/depthcharts
+
+This endpoint exposes true PG / SG / SF / PF / C slots.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import time
@@ -32,8 +31,6 @@ NBA_TEAMS = {
     "OKC","ORL","PHI","PHX","POR","SAC","SAS","TOR","UTA","WAS"
 }
 
-# ESPN's site API uses a few non-standard abbreviations.
-# Convert them to the canonical 3-letter NBA codes used by EDGE.
 ESPN_TEAM_ALIASES = {
     "GS": "GSW",
     "NO": "NOP",
@@ -50,9 +47,10 @@ TEAM_LIST_URL = (
     "sports/basketball/nba/teams?limit=100"
 )
 
-DEPTH_URL = (
-    "https://site.api.espn.com/apis/site/v2/"
-    "sports/basketball/nba/teams/{team_id}/depthcharts"
+CORE_DEPTH_URL = (
+    "https://sports.core.api.espn.com/v2/sports/basketball/"
+    "leagues/nba/seasons/{season}/teams/{team_id}/depthcharts"
+    "?lang=en&region=us"
 )
 
 HEADERS = {
@@ -68,11 +66,6 @@ session = requests.Session()
 session.headers.update(HEADERS)
 
 
-def canonical_team_abbr(value: Any) -> str:
-    abbr = str(value or "").upper().strip()
-    return ESPN_TEAM_ALIASES.get(abbr, abbr)
-
-
 def get_json(url: str, retries: int = 3) -> dict[str, Any]:
     last_error = None
 
@@ -84,16 +77,20 @@ def get_json(url: str, retries: int = 3) -> dict[str, Any]:
         except Exception as e:
             last_error = e
             if attempt < retries:
-                time.sleep(1.5 * attempt)
+                time.sleep(attempt)
 
     raise RuntimeError(f"Failed to fetch {url}: {last_error}")
 
 
+def canonical_team_abbr(value: Any) -> str:
+    abbr = str(value or "").upper().strip()
+    return ESPN_TEAM_ALIASES.get(abbr, abbr)
+
+
 def extract_team_entries(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    sports = payload.get("sports") or []
     out = []
 
-    for sport in sports:
+    for sport in payload.get("sports") or []:
         for league in sport.get("leagues") or []:
             for item in league.get("teams") or []:
                 team = item.get("team") or item
@@ -111,64 +108,39 @@ def athlete_id_from_ref(ref: str | None) -> str | None:
     return m.group(1) if m else None
 
 
-def dereference_athlete(obj: Any) -> dict[str, Any]:
-    """
-    ESPN depth-chart athlete values may be:
-      - a fully embedded athlete object
-      - {"$ref": "..."}
-      - {"athlete": {"$ref": "..."}}
-    """
-    if not isinstance(obj, dict):
+def fetch_ref(ref: str | None) -> dict[str, Any]:
+    if not ref:
         return {}
 
-    if obj.get("displayName") or obj.get("fullName"):
-        return obj
-
-    ref = obj.get("$ref")
-    if ref:
-        try:
-            return get_json(ref)
-        except Exception:
-            return {"id": athlete_id_from_ref(ref), "$ref": ref}
-
-    athlete = obj.get("athlete")
-    if isinstance(athlete, dict):
-        if athlete.get("displayName") or athlete.get("fullName"):
-            return athlete
-
-        ref = athlete.get("$ref")
-        if ref:
-            try:
-                return get_json(ref)
-            except Exception:
-                return {"id": athlete_id_from_ref(ref), "$ref": ref}
-
-    return {}
+    try:
+        return get_json(ref)
+    except Exception:
+        return {}
 
 
-def normalize_position(pos_key: str, pos_obj: dict[str, Any]) -> str | None:
+def normalize_position(position_obj: Any) -> str | None:
+    if not isinstance(position_obj, dict):
+        return None
+
     candidates = [
-        pos_key,
-        pos_obj.get("abbreviation"),
-        pos_obj.get("name"),
-        (pos_obj.get("position") or {}).get("abbreviation")
-        if isinstance(pos_obj.get("position"), dict)
-        else None,
+        position_obj.get("abbreviation"),
+        position_obj.get("name"),
+        position_obj.get("displayName"),
     ]
 
-    for v in candidates:
-        if not v:
+    aliases = {
+        "POINTGUARD": "PG",
+        "SHOOTINGGUARD": "SG",
+        "SMALLFORWARD": "SF",
+        "POWERFORWARD": "PF",
+        "CENTER": "C",
+    }
+
+    for value in candidates:
+        if not value:
             continue
 
-        s = str(v).upper().strip().replace(" ", "")
-        aliases = {
-            "POINTGUARD": "PG",
-            "SHOOTINGGUARD": "SG",
-            "SMALLFORWARD": "SF",
-            "POWERFORWARD": "PF",
-            "CENTER": "C",
-        }
-
+        s = str(value).upper().replace(" ", "").strip()
         s = aliases.get(s, s)
 
         if s in VALID_POSITIONS:
@@ -177,123 +149,117 @@ def normalize_position(pos_key: str, pos_obj: dict[str, Any]) -> str | None:
     return None
 
 
-def parse_athlete_entry(
-    team_abbr: str,
-    position: str,
-    item: dict[str, Any],
-    fallback_rank: int,
-) -> dict[str, Any] | None:
+def athlete_details(athlete_obj: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(athlete_obj, dict):
+        return {}
 
-    athlete_obj = item.get("athlete") if isinstance(item, dict) else None
+    if athlete_obj.get("displayName") or athlete_obj.get("fullName"):
+        return athlete_obj
 
-    if isinstance(athlete_obj, dict):
-        athlete = dereference_athlete(athlete_obj)
-    else:
-        athlete = dereference_athlete(item)
+    ref = athlete_obj.get("$ref")
+    data = fetch_ref(ref)
 
-    ref = None
-
-    if isinstance(athlete_obj, dict):
-        ref = athlete_obj.get("$ref")
-
-    if not ref and isinstance(item, dict):
-        ref = item.get("$ref")
-
-    athlete_id = (
-        str(athlete.get("id"))
-        if athlete.get("id") is not None
-        else athlete_id_from_ref(ref)
-    )
-
-    name = (
-        athlete.get("displayName")
-        or athlete.get("fullName")
-        or athlete.get("shortName")
-        or ""
-    )
-
-    if not athlete_id and not name:
-        return None
-
-    rank = item.get("rank") if isinstance(item, dict) else None
-
-    try:
-        rank = int(rank)
-    except Exception:
-        rank = fallback_rank
-
-    status_obj = athlete.get("status") or {}
-    status = None
-
-    if isinstance(status_obj, dict):
-        status = (
-            status_obj.get("type", {}).get("name")
-            if isinstance(status_obj.get("type"), dict)
-            else status_obj.get("name")
-        )
+    if data:
+        return data
 
     return {
-        "team": team_abbr,
-        "position": position,
-        "depth_rank": rank,
-        "starter": rank == 1,
-        "espn_athlete_id": athlete_id,
-        "player": name,
-        "short_name": athlete.get("shortName"),
-        "status": status,
+        "id": athlete_id_from_ref(ref),
+        "$ref": ref,
     }
 
 
-def parse_depth_chart(team: dict[str, Any]) -> list[dict[str, Any]]:
-    team_id = str(team["id"])
-    abbr = canonical_team_abbr(team["abbreviation"])
+def parse_core_depthchart(
+    team: dict[str, Any],
+    season: int,
+) -> list[dict[str, Any]]:
 
-    payload = get_json(DEPTH_URL.format(team_id=team_id))
+    team_id = str(team["id"])
+    team_abbr = canonical_team_abbr(team["abbreviation"])
+
+    url = CORE_DEPTH_URL.format(
+        season=season,
+        team_id=team_id,
+    )
+
+    payload = get_json(url)
     rows = []
 
-    # ESPN commonly returns items -> positions.
-    items = payload.get("items") or []
+    # CORE structure:
+    # items[] -> positions[] -> position + athletes[]
+    for chart in payload.get("items") or []:
+        for pos_obj in chart.get("positions") or []:
 
-    # Some site responses may expose positions directly.
-    if not items and payload.get("positions"):
-        items = [payload]
-
-    for chart in items:
-        positions = chart.get("positions") or {}
-
-        if isinstance(positions, list):
-            iterator = [(str(i), p) for i, p in enumerate(positions)]
-        elif isinstance(positions, dict):
-            iterator = positions.items()
-        else:
-            continue
-
-        for pos_key, pos_obj in iterator:
             if not isinstance(pos_obj, dict):
                 continue
 
-            position = normalize_position(str(pos_key), pos_obj)
+            position_ref_obj = pos_obj.get("position") or {}
+
+            if isinstance(position_ref_obj, dict) and position_ref_obj.get("$ref"):
+                position_data = fetch_ref(position_ref_obj.get("$ref"))
+            else:
+                position_data = position_ref_obj
+
+            position = normalize_position(position_data)
+
+            # Sometimes the abbreviation is available directly on the position row.
+            if not position:
+                position = normalize_position(pos_obj)
+
             if not position:
                 continue
 
-            athletes = pos_obj.get("athletes") or []
-
-            for idx, item in enumerate(athletes, start=1):
-                if not isinstance(item, dict):
+            for fallback_rank, athlete_entry in enumerate(
+                pos_obj.get("athletes") or [],
+                start=1,
+            ):
+                if not isinstance(athlete_entry, dict):
                     continue
 
-                row = parse_athlete_entry(
-                    team_abbr=abbr,
-                    position=position,
-                    item=item,
-                    fallback_rank=idx,
+                athlete_obj = athlete_entry.get("athlete") or {}
+                athlete = athlete_details(athlete_obj)
+
+                ref = (
+                    athlete_obj.get("$ref")
+                    if isinstance(athlete_obj, dict)
+                    else None
                 )
 
-                if row:
-                    rows.append(row)
+                athlete_id = (
+                    str(athlete.get("id"))
+                    if athlete.get("id") is not None
+                    else athlete_id_from_ref(ref)
+                )
 
-    # Defensive dedupe.
-    unique = {}
+                name = (
+                    athlete.get("displayName")
+                    or athlete.get("fullName")
+                    or athlete.get("shortName")
+                    or ""
+                )
+
+                if not athlete_id and not name:
+                    continue
+
+                rank = athlete_entry.get("rank")
+
+                try:
+                    rank = int(rank)
+                except Exception:
+                    rank = fallback_rank
+
+                rows.append({
+                    "team": team_abbr,
+                    "position": position,
+                    "depth_rank": rank,
+                    "starter": rank == 1,
+                    "espn_athlete_id": athlete_id,
+                    "player": name,
+                    "short_name": athlete.get("shortName"),
+                })
+
+    # Deduplicate within position.
+    deduped = {}
+
     for row in rows:
         key = (
             row["team"],
@@ -301,14 +267,16 @@ def parse_depth_chart(team: dict[str, Any]) -> list[dict[str, Any]]:
             row["espn_athlete_id"] or row["player"],
         )
 
-        if key not in unique or row["depth_rank"] < unique[key]["depth_rank"]:
-            unique[key] = row
+        if key not in deduped or row["depth_rank"] < deduped[key]["depth_rank"]:
+            deduped[key] = row
+
+    order = {"PG": 0, "SG": 1, "SF": 2, "PF": 3, "C": 4}
 
     return sorted(
-        unique.values(),
+        deduped.values(),
         key=lambda x: (
             x["team"],
-            ["PG", "SG", "SF", "PF", "C"].index(x["position"]),
+            order.get(x["position"], 99),
             x["depth_rank"],
             x["player"],
         ),
@@ -316,30 +284,36 @@ def parse_depth_chart(team: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--season",
+        type=int,
+        default=2026,
+        help="NBA season ending year. 2026 = 2025-26.",
+    )
+
+    args = parser.parse_args()
+    season = args.season
+
     team_payload = get_json(TEAM_LIST_URL)
-    teams = extract_team_entries(team_payload)
+    raw_teams = extract_team_entries(team_payload)
 
-    selected = []
+    selected_by_abbr = {}
 
-    for team in teams:
-        raw_abbr = str(team.get("abbreviation") or "").upper().strip()
+    for team in raw_teams:
+        raw_abbr = team.get("abbreviation")
         abbr = canonical_team_abbr(raw_abbr)
 
-        if abbr in NBA_TEAMS:
-            selected.append({
+        if abbr in NBA_TEAMS and team.get("id") is not None:
+            selected_by_abbr[abbr] = {
                 "id": team.get("id"),
                 "abbreviation": abbr,
                 "espn_abbreviation": raw_abbr,
                 "displayName": team.get("displayName"),
-            })
+            }
 
-    # Defensive dedupe in case ESPN exposes duplicate team aliases.
-    selected_by_abbr = {}
-    for team in selected:
-        selected_by_abbr[team["abbreviation"]] = team
-    selected = list(selected_by_abbr.values())
-
-    found = {x["abbreviation"] for x in selected}
+    found = set(selected_by_abbr)
     missing = sorted(NBA_TEAMS - found)
 
     if missing:
@@ -350,28 +324,25 @@ def main() -> None:
     all_rows = []
     team_status = []
 
-    for idx, team in enumerate(
-        sorted(selected, key=lambda x: x["abbreviation"]),
-        start=1
-    ):
-        abbr = team["abbreviation"]
+    for idx, abbr in enumerate(sorted(NBA_TEAMS), start=1):
+        team = selected_by_abbr[abbr]
 
         try:
-            rows = parse_depth_chart(team)
-            all_rows.extend(rows)
+            rows = parse_core_depthchart(team, season)
+            positions = sorted({x["position"] for x in rows})
 
-            positions = sorted({r["position"] for r in rows})
+            all_rows.extend(rows)
 
             team_status.append({
                 "team": abbr,
                 "rows": len(rows),
                 "positions": positions,
-                "success": True,
+                "success": len(rows) > 0,
             })
 
             print(
                 f"[{idx:02d}/30] {abbr}: "
-                f"{len(rows)} depth rows | {positions}"
+                f"{len(rows)} rows | {positions}"
             )
 
         except Exception as e:
@@ -385,34 +356,31 @@ def main() -> None:
 
             print(f"[{idx:02d}/30] {abbr}: ERROR {e}")
 
-        time.sleep(0.15)
+        time.sleep(0.10)
 
-    successful_teams = {
-        x["team"]
-        for x in team_status
-        if x["success"]
-    }
-
-    teams_with_all_five = {
-        x["team"]
-        for x in team_status
+    successful = [x for x in team_status if x["success"]]
+    all_five = [
+        x for x in successful
         if set(x["positions"]) == VALID_POSITIONS
-    }
+    ]
 
     payload = {
-        "success": len(successful_teams) == 30,
+        "success": len(successful) == 30 and len(all_rows) > 0,
         "dataset": "edge_nba_depthcharts",
+        "season": season,
+        "season_label": f"{season-1}-{str(season)[-2:]}",
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "source": "ESPN",
+        "source": "ESPN CORE API",
         "positions": ["PG", "SG", "SF", "PF", "C"],
         "players": all_rows,
         "validation": {
             "expected_teams": 30,
-            "successful_teams": len(successful_teams),
+            "successful_teams": len(successful),
             "player_rows": len(all_rows),
-            "teams_with_all_five_positions": len(teams_with_all_five),
+            "teams_with_all_five_positions": len(all_five),
             "failed_teams": [
-                x for x in team_status if not x["success"]
+                x for x in team_status
+                if not x["success"]
             ],
             "team_status": team_status,
         },
@@ -434,15 +402,15 @@ def main() -> None:
 
     print(f"Built: {out_file}")
     print(
-        "Validation: "
-        f"{len(successful_teams)}/30 teams | "
-        f"{len(teams_with_all_five)}/30 with all five positions | "
+        f"Validation: {len(successful)}/30 teams | "
+        f"{len(all_five)}/30 with all five positions | "
         f"{len(all_rows)} player rows"
     )
 
-    if len(successful_teams) != 30:
+    # Important: do NOT allow a false-positive green Action.
+    if len(successful) != 30 or len(all_rows) == 0:
         raise RuntimeError(
-            "Depth-chart fetch did not succeed for all 30 NBA teams."
+            "ESPN depth-chart fetch produced incomplete/empty data."
         )
 
 
